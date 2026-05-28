@@ -13,6 +13,7 @@ import yaml
 from pydub import AudioSegment
 from tqdm import tqdm
 
+from audio_path_resolver import resolved_audio_path
 from asr_model_parser import ASRParser
 from transcription_agreement import enrich_dataframe
 
@@ -84,9 +85,10 @@ def resolve_device(index: int, *, same_gpu: bool) -> torch.device:
     return torch.device(f"cuda:{index % device_count}")
 
 
-def detect_silence(audio_path: Path, threshold: float) -> bool:
+def detect_silence(audio_path: str | Path, threshold: float) -> bool:
     try:
-        audio = AudioSegment.from_file(audio_path)
+        with resolved_audio_path(audio_path) as resolved_path:
+            audio = AudioSegment.from_file(resolved_path)
     except FileNotFoundError:
         LOGGER.warning("Audio file %s not found; treating as non-silence.", audio_path)
         return False
@@ -105,7 +107,7 @@ def compute_silence_flags(
 
     flags: Dict[int, bool] = {}
     for idx, path in iterator:
-        flags[idx] = detect_silence(Path(path), threshold)
+        flags[idx] = detect_silence(path, threshold)
     return flags
 
 
@@ -142,7 +144,7 @@ def transcribe_parallel(
                 frame.at[idx, model_name] = SILENCE_TOKEN
             continue
 
-        audio_path = Path(frame.at[idx, "wav"])
+        audio_path = frame.at[idx, "wav"]
         for model_name, parser in parsers:
             try:
                 frame.at[idx, model_name] = parser.transcribe(audio_path)
@@ -182,7 +184,7 @@ def transcribe_sequential(
         for idx in iterator:
             if silence_flags.get(idx, False):
                 continue
-            audio_path = Path(frame.at[idx, "wav"])
+            audio_path = frame.at[idx, "wav"]
             try:
                 frame.at[idx, model_name] = parser.transcribe(audio_path)
             except Exception:  # noqa: BLE001

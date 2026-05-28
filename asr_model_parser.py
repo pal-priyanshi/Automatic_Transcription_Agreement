@@ -18,6 +18,8 @@ from transformers import (
     pipeline,
 )
 
+from audio_path_resolver import is_tar_uri, resolved_audio_path
+
 LOGGER = logging.getLogger(__name__)
 
 PathLike = Union[str, Path]
@@ -85,16 +87,16 @@ class ASRParser:
             Whisper, Phi-4).
         """
 
-        path = Path(audio_file)
-        if not path.exists():
+        if not is_tar_uri(audio_file) and not Path(audio_file).exists():
             raise FileNotFoundError(f"Audio file '{audio_file}' was not found.")
 
-        if self.model_name == "whisper":
-            return self._transcribe_with_whisper(path, generate_kwargs)
-        if self.model_name == "phi4":
-            return self._transcribe_with_phi4(path, generate_kwargs)
-        if self.model_name == "conformer":
-            return self._transcribe_with_conformer(path)
+        with resolved_audio_path(audio_file) as path:
+            if self.model_name == "whisper":
+                return self._transcribe_with_whisper(path, generate_kwargs)
+            if self.model_name == "phi4":
+                return self._transcribe_with_phi4(path, generate_kwargs)
+            if self.model_name == "conformer":
+                return self._transcribe_with_conformer(path)
 
         raise RuntimeError(
             f"No transcription routine registered for model '{self.model_name}'."

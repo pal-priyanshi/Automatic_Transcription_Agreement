@@ -37,11 +37,12 @@ def find_tar_member(tar: tarfile.TarFile, inner_path: str) -> tarfile.TarInfo:
     except KeyError:
         pass
 
-    matches = [
-        member
-        for member in tar.getmembers()
-        if member.isfile() and member.name.endswith(inner_path)
-    ]
+    members = [member for member in tar.getmembers() if member.isfile()]
+    matches = [member for member in members if member.name.endswith(inner_path)]
+    if not matches:
+        basename = Path(inner_path).name
+        matches = [member for member in members if Path(member.name).name == basename]
+
     if len(matches) == 1:
         return matches[0]
 

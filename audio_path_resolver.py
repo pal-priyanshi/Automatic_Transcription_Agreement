@@ -30,6 +30,30 @@ def parse_tar_uri(audio_path: PathLike) -> tuple[Path, str]:
     return Path(shard), inner_path
 
 
+def find_tar_member(tar: tarfile.TarFile, inner_path: str) -> tarfile.TarInfo:
+    """Find an audio member, allowing Emilia JSON paths to omit tar prefixes."""
+    try:
+        return tar.getmember(inner_path)
+    except KeyError:
+        pass
+
+    matches = [
+        member
+        for member in tar.getmembers()
+        if member.isfile() and member.name.endswith(inner_path)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+
+    if not matches:
+        raise KeyError(f"filename {inner_path!r} not found")
+
+    match_names = [member.name for member in matches[:5]]
+    raise KeyError(
+        f"filename {inner_path!r} matched multiple tar members: {match_names}"
+    )
+
+
 @contextmanager
 def resolved_audio_path(audio_path: PathLike) -> Iterator[Path]:
     """Yield a real filesystem path for normal audio files or tar members.
@@ -49,7 +73,8 @@ def resolved_audio_path(audio_path: PathLike) -> Iterator[Path]:
         tmp_audio = Path(tmp_dir) / f"audio{suffix}"
 
         with tarfile.open(shard, "r:*") as tar:
-            extracted = tar.extractfile(inner_path)
+            member = find_tar_member(tar, inner_path)
+            extracted = tar.extractfile(member)
             if extracted is None:
                 raise FileNotFoundError(f"Could not read {inner_path} from {shard}")
 

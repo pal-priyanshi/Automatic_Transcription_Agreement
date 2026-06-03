@@ -22,43 +22,28 @@ from transcription_agreement import enrich_dataframe
 LOGGER = logging.getLogger(__name__)
 ERROR_TOKEN = "<Error>"
 
+DEFAULT_BATCH_SIZE = 16
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("csv", type=Path, help="Input CSV file containing a 'wav' column.")
+    parser.add_argument("csv", type=Path, help="Input CSV file containing required columns.")
+    parser.add_argument("config", type=Path, help="YAML file with 'asr_models' entry.")
+    parser.add_argument("--output", type=Path, help="Destination CSV path.")
     parser.add_argument(
-        "config",
-        type=Path,
-        help="YAML file with 'asr_models' entry.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="Destination CSV path. Defaults to 'transcribed_<input name>'.",
-    )
-    parser.add_argument(
-        "--same-gpu",
-        action="store_true",
+        "--same-gpu", action="store_true",
         help="Load every model on the first CUDA device instead of spreading them.",
     )
     parser.add_argument(
-        "--sequential",
-        action="store_true",
-        help=(
-            "Load one model at a time to reduce peak GPU memory. "
-            "Streams through the tar once per model instead of loading all models simultaneously."
-        ),
+        "--sequential", action="store_true",
+        help="Load one model at a time (lower peak GPU memory, reads tar once per model).",
     )
     parser.add_argument(
-        "--skip-agreement",
-        action="store_true",
-        help="Only store raw transcripts without computing agreement columns.",
+        "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+        help=f"Number of audio files to transcribe per batch (default {DEFAULT_BATCH_SIZE}).",
     )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable progress bars during processing.",
-    )
+    parser.add_argument("--skip-agreement", action="store_true")
+    parser.add_argument("--no-progress", action="store_true")
     return parser.parse_args()
 
 
@@ -72,12 +57,10 @@ def resolve_device(index: int, *, same_gpu: bool) -> torch.device:
         return torch.device("cpu")
     if same_gpu:
         return torch.device("cuda:0")
-    device_count = max(torch.cuda.device_count(), 1)
-    return torch.device(f"cuda:{index % device_count}")
+    return torch.device(f"cuda:{index % max(torch.cuda.device_count(), 1)}")
 
 
 def decode_mp3_bytes(audio_bytes: bytes) -> Tuple[np.ndarray, int]:
-    """Decode raw audio bytes into a numpy array via soundfile."""
     audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
     return audio, int(sr)
 
@@ -87,11 +70,25 @@ def basename(inner_path: str) -> str:
 
 
 def build_basename_index(group: pd.DataFrame) -> Dict[str, int]:
-    """Map mp3 basename → DataFrame row index for a shard group."""
-    return {
-        basename(row["inner_path"]): idx
-        for idx, row in group.iterrows()
-    }
+    return {basename(row["inner_path"]): idx for idx, row in group.iterrows()}
+
+
+def flush_batch(
+    batch_indices: List[int],
+    batch_audio: List[Tuple[np.ndarray, int]],
+    parsers: List[Tuple[str, ASRParser]],
+    frame: pd.DataFrame,
+) -> None:
+    """Transcribe a collected batch with all models and write results into frame."""
+    for name, parser in parsers:
+        try:
+            results = parser.transcribe_batch(batch_audio)
+            for idx, text in zip(batch_indices, results):
+                frame.at[idx, name] = text
+        except Exception:
+            LOGGER.exception("Batch transcription failed for model %s", name)
+            for idx in batch_indices:
+                frame.at[idx, name] = ERROR_TOKEN
 
 
 def stream_shard_parallel(
@@ -99,21 +96,21 @@ def stream_shard_parallel(
     group: pd.DataFrame,
     parsers: List[Tuple[str, ASRParser]],
     model_names: Sequence[str],
+    batch_size: int,
     *,
     show_progress: bool,
 ) -> pd.DataFrame:
-    """Stream tar once with all models loaded — one tar open, both models transcribe per file."""
+    """Open tar once, buffer audio into batches, transcribe with all models per batch."""
     frame = group.copy()
     for name in model_names:
         if name not in frame.columns:
             frame[name] = ""
 
     basename_to_idx = build_basename_index(frame)
-    progress = tqdm(
-        total=len(frame),
-        desc=Path(shard_path).name,
-        disable=not show_progress,
-    )
+    progress = tqdm(total=len(frame), desc=Path(shard_path).name, disable=not show_progress)
+
+    batch_indices: List[int] = []
+    batch_audio: List[Tuple[np.ndarray, int]] = []
 
     with tarfile.open(shard_path, "r:*") as tar:
         for member in tar:
@@ -136,14 +133,18 @@ def stream_shard_parallel(
                 progress.update(1)
                 continue
 
-            for name, parser in parsers:
-                try:
-                    frame.at[idx, name] = parser.transcribe((audio, sr))
-                except Exception:
-                    LOGGER.exception("Transcription failed for %s with %s", member.name, name)
-                    frame.at[idx, name] = ERROR_TOKEN
+            batch_indices.append(idx)
+            batch_audio.append((audio, sr))
 
-            progress.update(1)
+            if len(batch_audio) >= batch_size:
+                flush_batch(batch_indices, batch_audio, parsers, frame)
+                progress.update(len(batch_indices))
+                batch_indices, batch_audio = [], []
+
+    # flush remaining
+    if batch_audio:
+        flush_batch(batch_indices, batch_audio, parsers, frame)
+        progress.update(len(batch_indices))
 
     progress.close()
     return frame
@@ -153,15 +154,12 @@ def stream_shard_sequential(
     shard_path: str,
     group: pd.DataFrame,
     model_names: Sequence[str],
+    batch_size: int,
     *,
     same_gpu: bool,
     show_progress: bool,
 ) -> pd.DataFrame:
-    """Load one model at a time, streaming through the tar once per model.
-
-    Uses less peak GPU memory than parallel mode at the cost of reading
-    the tar N times (once per model).
-    """
+    """Load one model at a time, stream tar once per model, process in batches."""
     frame = group.copy()
     for name in model_names:
         if name not in frame.columns:
@@ -179,6 +177,9 @@ def stream_shard_sequential(
             desc=f"{Path(shard_path).name} [{model_name}]",
             disable=not show_progress,
         )
+
+        batch_indices: List[int] = []
+        batch_audio: List[Tuple[np.ndarray, int]] = []
 
         with tarfile.open(shard_path, "r:*") as tar:
             for member in tar:
@@ -200,13 +201,32 @@ def stream_shard_sequential(
                     progress.update(1)
                     continue
 
-                try:
-                    frame.at[idx, model_name] = parser.transcribe((audio, sr))
-                except Exception:
-                    LOGGER.exception("Transcription failed for %s with %s", member.name, model_name)
-                    frame.at[idx, model_name] = ERROR_TOKEN
+                batch_indices.append(idx)
+                batch_audio.append((audio, sr))
 
-                progress.update(1)
+                if len(batch_audio) >= batch_size:
+                    try:
+                        results = parser.transcribe_batch(batch_audio)
+                        for i, text in zip(batch_indices, results):
+                            frame.at[i, model_name] = text
+                    except Exception:
+                        LOGGER.exception("Batch failed for %s", model_name)
+                        for i in batch_indices:
+                            frame.at[i, model_name] = ERROR_TOKEN
+                    progress.update(len(batch_indices))
+                    batch_indices, batch_audio = [], []
+
+        # flush remaining
+        if batch_audio:
+            try:
+                results = parser.transcribe_batch(batch_audio)
+                for i, text in zip(batch_indices, results):
+                    frame.at[i, model_name] = text
+            except Exception:
+                LOGGER.exception("Batch failed for %s", model_name)
+                for i in batch_indices:
+                    frame.at[i, model_name] = ERROR_TOKEN
+            progress.update(len(batch_indices))
 
         progress.close()
         del parser
@@ -239,28 +259,23 @@ def main() -> None:
 
     shards = list(df.groupby("shard"))
     LOGGER.info(
-        "Processing %d shard(s) with %d model(s) in %s mode",
-        len(shards),
-        len(model_names),
+        "Processing %d shard(s) with %d model(s) in %s mode (batch_size=%d)",
+        len(shards), len(model_names),
         "sequential" if args.sequential else "parallel",
+        args.batch_size,
     )
 
     results: List[pd.DataFrame] = []
 
     if args.sequential:
-        # Models loaded one at a time — tar opened once per model per shard.
         for shard_path, group in shards:
             LOGGER.info("Shard: %s (%d utterances)", shard_path, len(group))
             transcribed = stream_shard_sequential(
-                shard_path,
-                group,
-                model_names,
-                same_gpu=args.same_gpu,
-                show_progress=not args.no_progress,
+                shard_path, group, model_names, args.batch_size,
+                same_gpu=args.same_gpu, show_progress=not args.no_progress,
             )
             results.append(transcribed)
     else:
-        # All models loaded upfront — tar opened once per shard.
         parsers: List[Tuple[str, ASRParser]] = []
         for idx, name in enumerate(model_names):
             device = resolve_device(idx, same_gpu=args.same_gpu)
@@ -270,10 +285,7 @@ def main() -> None:
         for shard_path, group in shards:
             LOGGER.info("Shard: %s (%d utterances)", shard_path, len(group))
             transcribed = stream_shard_parallel(
-                shard_path,
-                group,
-                parsers,
-                model_names,
+                shard_path, group, parsers, model_names, args.batch_size,
                 show_progress=not args.no_progress,
             )
             results.append(transcribed)

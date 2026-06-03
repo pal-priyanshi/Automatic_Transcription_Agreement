@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -23,6 +23,7 @@ LOGGER = logging.getLogger(__name__)
 
 PathLike = Union[str, Path]
 AudioInput = Union[PathLike, Tuple[np.ndarray, int]]  # path or (array, sample_rate)
+AudioBatch = List[Tuple[np.ndarray, int]]             # list of (array, sample_rate)
 
 
 class ASRParser:
@@ -73,32 +74,39 @@ class ASRParser:
         *,
         generate_kwargs: Optional[Dict[str, Union[int, float]]] = None,
     ) -> str:
-        """Run transcription with the configured backend.
+        """Transcribe a single audio input.
 
         Parameters
         ----------
         audio:
             Either a filesystem path / tar URI string, or a pre-loaded
-            ``(numpy_array, sample_rate)`` tuple.  Passing an array avoids
-            any disk I/O — prefer this when the audio is already in memory.
-        generate_kwargs:
-            Optional keyword arguments forwarded to generative models.
+            ``(numpy_array, sample_rate)`` tuple.
         """
-        if isinstance(audio, tuple):
-            audio_array, sr = audio
-        else:
-            if not Path(str(audio)).exists() and not str(audio).startswith("tar://"):
-                raise FileNotFoundError(f"Audio file '{audio}' was not found.")
-            audio_array, sr = resolved_audio_array(audio)
+        results = self.transcribe_batch([self._resolve(audio)], generate_kwargs=generate_kwargs)
+        return results[0]
+
+    def transcribe_batch(
+        self,
+        batch: AudioBatch,
+        *,
+        generate_kwargs: Optional[Dict[str, Union[int, float]]] = None,
+    ) -> List[str]:
+        """Transcribe a batch of audio inputs, returning one string per input.
+
+        Parameters
+        ----------
+        batch:
+            List of ``(numpy_array, sample_rate)`` tuples.
+        """
+        if not batch:
+            return []
 
         if self.model_name == "whisper":
-            return self._transcribe_with_whisper(audio_array, sr, generate_kwargs)
+            return self._transcribe_batch_whisper(batch, generate_kwargs)
         if self.model_name == "phi4":
-            return self._transcribe_with_phi4(audio_array, sr, generate_kwargs)
+            return self._transcribe_batch_phi4(batch, generate_kwargs)
 
-        raise RuntimeError(
-            f"No transcription routine registered for model '{self.model_name}'."
-        )
+        raise RuntimeError(f"No transcription routine registered for '{self.model_name}'.")
 
     @staticmethod
     def normalize_text(transcription: str) -> str:
@@ -111,12 +119,19 @@ class ASRParser:
 
     @classmethod
     def supported_models(cls) -> tuple:
-        """Return a tuple of the recognised model identifiers."""
         return tuple(sorted(cls._MODEL_LOADERS.keys()))
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _resolve(self, audio: AudioInput) -> Tuple[np.ndarray, int]:
+        """Convert a path or (array, sr) tuple into (array, sr)."""
+        if isinstance(audio, tuple):
+            return audio
+        if not Path(str(audio)).exists() and not str(audio).startswith("tar://"):
+            raise FileNotFoundError(f"Audio file '{audio}' was not found.")
+        return resolved_audio_array(audio)
+
     def _load_whisper(self) -> None:
         model_id = "openai/whisper-large-v3"
         torch_dtype = torch.float16 if self.device.type == "cuda" else torch.float32
@@ -167,29 +182,30 @@ class ASRParser:
             f"{prompt_suffix}{assistant_prompt}"
         )
 
-    def _transcribe_with_whisper(
+    def _transcribe_batch_whisper(
         self,
-        audio_array: np.ndarray,
-        sample_rate: int,
-        generate_kwargs: Optional[Dict[str, Union[int, float]]],
-    ) -> str:
-        kwargs = generate_kwargs or {}
-        result = self.pipe(
-            {"array": audio_array, "sampling_rate": sample_rate},
-            generate_kwargs=kwargs,
-        )
-        return self.normalize_text(result["text"])
+        batch: AudioBatch,
+        generate_kwargs: Optional[Dict],
+    ) -> List[str]:
+        """Pass the whole batch to the HuggingFace pipeline at once."""
+        inputs = [{"array": audio, "sampling_rate": sr} for audio, sr in batch]
+        kwargs = {"language": "en"}
+        if generate_kwargs:
+            kwargs.update(generate_kwargs)
+        results = self.pipe(inputs, batch_size=len(inputs), generate_kwargs=kwargs)
+        return [self.normalize_text(r["text"]) for r in results]
 
-    def _transcribe_with_phi4(
+    def _transcribe_batch_phi4(
         self,
-        audio_array: np.ndarray,
-        sample_rate: int,
-        generate_kwargs: Optional[Dict[str, Union[int, float]]],
-    ) -> str:
+        batch: AudioBatch,
+        generate_kwargs: Optional[Dict],
+    ) -> List[str]:
+        """Process phi4 batch — pad inputs and decode all at once."""
         inputs = self.processor(
-            text=self.prompt,
-            audios=[(audio_array, sample_rate)],
+            text=[self.prompt] * len(batch),
+            audios=batch,
             return_tensors="pt",
+            padding=True,
         ).to(self.device)
 
         kwargs = {
@@ -202,13 +218,14 @@ class ASRParser:
 
         with torch.inference_mode():
             generated_ids = self.model.generate(**inputs, **kwargs)
+
         generated_ids = generated_ids[:, inputs["input_ids"].shape[1]:]
-        transcription = self.processor.batch_decode(
+        transcriptions = self.processor.batch_decode(
             generated_ids,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
-        )[0]
-        return self.normalize_text(transcription)
+        )
+        return [self.normalize_text(t) for t in transcriptions]
 
 
 # Backwards compatibility for previous naming convention.

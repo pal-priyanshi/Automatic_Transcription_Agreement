@@ -158,6 +158,7 @@ def stream_shard_sequential(
     *,
     same_gpu: bool,
     show_progress: bool,
+    checkpoint_path: Optional[Path] = None,
 ) -> pd.DataFrame:
     """Load one model at a time, stream tar once per model, process in batches."""
     frame = group.copy()
@@ -231,7 +232,20 @@ def stream_shard_sequential(
         progress.close()
         del parser
         if torch.cuda.is_available():
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+        # Save partial results after each model completes so progress is not lost
+        # if a subsequent model crashes.
+        if checkpoint_path is not None:
+            frame.to_csv(
+                checkpoint_path,
+                mode="w" if model_idx == 0 else "w",
+                header=True,
+                index=False,
+            )
+            LOGGER.info("Checkpoint saved after %s → %s", model_name, checkpoint_path)
 
     return frame
 
@@ -265,7 +279,8 @@ def main() -> None:
         args.batch_size,
     )
 
-    results: List[pd.DataFrame] = []
+    output_path = compute_output_path(args.csv, args.output)
+    write_header = True  # first shard writes header, rest append
 
     if args.sequential:
         for shard_path, group in shards:
@@ -273,8 +288,21 @@ def main() -> None:
             transcribed = stream_shard_sequential(
                 shard_path, group, model_names, args.batch_size,
                 same_gpu=args.same_gpu, show_progress=not args.no_progress,
+                checkpoint_path=output_path,
             )
-            results.append(transcribed)
+            if not args.skip_agreement:
+                transcribed = enrich_dataframe(
+                    transcribed,
+                    emilia_text_column="text",
+                    whisper_column="whisper",
+                    phi4_column="phi4",
+                    normalize_fn=ASRParser.normalize_text,
+                    show_progress=not args.no_progress,
+                )
+            transcribed.to_csv(output_path, mode="w" if write_header else "a",
+                               header=write_header, index=False)
+            write_header = False
+            LOGGER.info("Saved progress to %s", output_path)
     else:
         parsers: List[Tuple[str, ASRParser]] = []
         for idx, name in enumerate(model_names):
@@ -288,24 +316,19 @@ def main() -> None:
                 shard_path, group, parsers, model_names, args.batch_size,
                 show_progress=not args.no_progress,
             )
-            results.append(transcribed)
-
-    combined = pd.concat(results, ignore_index=False)
-
-    if not args.skip_agreement:
-        LOGGER.info("Computing agreement metrics")
-        combined = enrich_dataframe(
-            combined,
-            emilia_text_column="text",
-            whisper_column="whisper",
-            phi4_column="phi4",
-            normalize_fn=ASRParser.normalize_text,
-            show_progress=not args.no_progress,
-        )
-
-    output_path = compute_output_path(args.csv, args.output)
-    LOGGER.info("Writing results to %s", output_path)
-    combined.to_csv(output_path, index=False)
+            if not args.skip_agreement:
+                transcribed = enrich_dataframe(
+                    transcribed,
+                    emilia_text_column="text",
+                    whisper_column="whisper",
+                    phi4_column="phi4",
+                    normalize_fn=ASRParser.normalize_text,
+                    show_progress=not args.no_progress,
+                )
+            transcribed.to_csv(output_path, mode="w" if write_header else "a",
+                               header=write_header, index=False)
+            write_header = False
+            LOGGER.info("Saved progress to %s", output_path)
 
 
 if __name__ == "__main__":

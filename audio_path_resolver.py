@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import shutil
+import io
 import tarfile
-import tempfile
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Union
+from typing import Iterator, Tuple, Union
+
+import numpy as np
+import soundfile as sf
 
 PathLike = Union[str, Path]
+AudioArray = Tuple[np.ndarray, int]  # (samples, sample_rate)
 
 
 def is_tar_uri(audio_path: PathLike) -> bool:
@@ -23,7 +25,7 @@ def parse_tar_uri(audio_path: PathLike) -> tuple[Path, str]:
     if not value.startswith("tar://") or "::" not in value:
         raise ValueError(f"Expected tar URI in the form tar://SHARD::MEMBER, got {value}")
 
-    shard, inner_path = value[len("tar://") :].split("::", 1)
+    shard, inner_path = value[len("tar://"):].split("::", 1)
     if not shard or not inner_path:
         raise ValueError(f"Expected tar URI in the form tar://SHARD::MEMBER, got {value}")
 
@@ -55,31 +57,52 @@ def find_tar_member(tar: tarfile.TarFile, inner_path: str) -> tarfile.TarInfo:
     )
 
 
-@contextmanager
-def resolved_audio_path(audio_path: PathLike) -> Iterator[Path]:
-    """Yield a real filesystem path for normal audio files or tar members.
+def resolved_audio_array(audio_path: PathLike) -> AudioArray:
+    """Return ``(samples_array, sample_rate)`` for a normal path or tar URI.
 
-    Existing ATA backends expect ordinary files. For normal paths we simply
-    yield the input path. For ``tar://`` paths, we copy only the requested member
-    into a temporary directory and delete it after the caller is done.
+    For regular filesystem paths, reads directly with soundfile.
+    For ``tar://SHARD::MEMBER`` URIs, extracts the member bytes into a
+    ``BytesIO`` buffer and reads from there — no temp files, no disk I/O.
     """
     if not is_tar_uri(audio_path):
-        yield Path(audio_path)
-        return
+        audio, sr = sf.read(str(audio_path), dtype="float32", always_2d=False)
+        return audio, int(sr)
 
     shard, inner_path = parse_tar_uri(audio_path)
-    suffix = Path(inner_path).suffix or ".audio"
+    with tarfile.open(shard, "r:*") as tar:
+        member = find_tar_member(tar, inner_path)
+        extracted = tar.extractfile(member)
+        if extracted is None:
+            raise FileNotFoundError(f"Could not read {inner_path} from {shard}")
+        audio_bytes = extracted.read()
 
-    with tempfile.TemporaryDirectory(prefix="ata_tar_audio_") as tmp_dir:
-        tmp_audio = Path(tmp_dir) / f"audio{suffix}"
+    audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+    return audio, int(sr)
 
-        with tarfile.open(shard, "r:*") as tar:
-            member = find_tar_member(tar, inner_path)
+
+def stream_tar_audio(
+    tar_path: Path,
+    member_names: set[str],
+) -> Iterator[tuple[str, np.ndarray, int]]:
+    """Stream audio arrays from a single tar, opening it only once.
+
+    Yields ``(member_name, samples_array, sample_rate)`` for each requested
+    member found in the archive, in archive order.  Use this when processing
+    multiple files from the same tar to avoid reopening it per file.
+    """
+    with tarfile.open(tar_path, "r:*") as tar:
+        for member in tar:
+            if not member.isfile():
+                continue
+            name = Path(member.name).name
+            if member.name not in member_names and name not in member_names:
+                continue
             extracted = tar.extractfile(member)
             if extracted is None:
-                raise FileNotFoundError(f"Could not read {inner_path} from {shard}")
-
-            with tmp_audio.open("wb") as out_f:
-                shutil.copyfileobj(extracted, out_f)
-
-        yield tmp_audio
+                continue
+            audio_bytes = extracted.read()
+            try:
+                audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+                yield member.name, audio, int(sr)
+            except Exception:
+                pass

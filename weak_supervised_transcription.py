@@ -7,13 +7,13 @@ import logging
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 import yaml
-from pydub import AudioSegment
 from tqdm import tqdm
 
-from audio_path_resolver import resolved_audio_path
+from audio_path_resolver import resolved_audio_array
 from asr_model_parser import ASRParser
 from transcription_agreement import enrich_dataframe
 
@@ -53,8 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--silence-threshold",
         type=float,
-        default=-50.0,
-        help="dBFS threshold used to treat an utterance as silence.",
+        default=0.01,
+        help="RMS amplitude threshold below which an utterance is treated as silence (default 0.01).",
     )
     parser.add_argument(
         "--no-progress",
@@ -85,29 +85,50 @@ def resolve_device(index: int, *, same_gpu: bool) -> torch.device:
     return torch.device(f"cuda:{index % device_count}")
 
 
-def detect_silence(audio_path: str | Path, threshold: float) -> bool:
-    try:
-        with resolved_audio_path(audio_path) as resolved_path:
-            audio = AudioSegment.from_file(resolved_path)
-    except FileNotFoundError:
-        LOGGER.warning("Audio file %s not found; treating as non-silence.", audio_path)
-        return False
-    except Exception:  # noqa: BLE001
-        LOGGER.exception("Failed to load %s for silence detection.", audio_path)
-        return False
-    return audio.dBFS < threshold
+def is_silent(audio: np.ndarray, threshold: float) -> bool:
+    """Return True when the RMS amplitude of *audio* is below *threshold*.
+
+    This replaces the previous pydub-based approach: no decoding to disk,
+    no temp files — just a single numpy reduction over the already-loaded array.
+    """
+    rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+    return rms < threshold
+
+
+def load_audio_arrays(
+    df: pd.DataFrame, *, show_progress: bool
+) -> Dict[int, Tuple[np.ndarray, int]]:
+    """Load every audio file once and return a mapping of row-index → (array, sr).
+
+    Loading up-front means silence detection and all ASR models share the same
+    decoded arrays — no file is opened more than once.
+    """
+    iterator = df["wav"].items()
+    if show_progress:
+        iterator = tqdm(iterator, total=df.shape[0], desc="Loading audio")
+
+    arrays: Dict[int, Tuple[np.ndarray, int]] = {}
+    for idx, path in iterator:
+        try:
+            arrays[idx] = resolved_audio_array(path)
+        except Exception:
+            LOGGER.exception("Failed to load audio for row %d: %s", idx, path)
+    return arrays
 
 
 def compute_silence_flags(
-    df: pd.DataFrame, threshold: float, *, show_progress: bool
+    arrays: Dict[int, Tuple[np.ndarray, int]],
+    threshold: float,
+    *,
+    show_progress: bool,
 ) -> Dict[int, bool]:
-    iterator = df["wav"].items()
+    iterator = arrays.items()
     if show_progress:
-        iterator = tqdm(iterator, total=df.shape[0], desc="Silence detection")
+        iterator = tqdm(iterator, total=len(arrays), desc="Silence detection")
 
     flags: Dict[int, bool] = {}
-    for idx, path in iterator:
-        flags[idx] = detect_silence(path, threshold)
+    for idx, (audio, _sr) in iterator:
+        flags[idx] = is_silent(audio, threshold)
     return flags
 
 
@@ -121,6 +142,7 @@ def transcribe_parallel(
     df: pd.DataFrame,
     model_names: Sequence[str],
     silence_flags: Dict[int, bool],
+    arrays: Dict[int, Tuple[np.ndarray, int]],
     *,
     same_gpu: bool,
     show_progress: bool,
@@ -144,13 +166,18 @@ def transcribe_parallel(
                 frame.at[idx, model_name] = SILENCE_TOKEN
             continue
 
-        audio_path = frame.at[idx, "wav"]
+        audio_input = arrays.get(idx)
+        if audio_input is None:
+            for model_name, _ in parsers:
+                frame.at[idx, model_name] = ERROR_TOKEN
+            continue
+
         for model_name, parser in parsers:
             try:
-                frame.at[idx, model_name] = parser.transcribe(audio_path)
+                frame.at[idx, model_name] = parser.transcribe(audio_input)
             except Exception:  # noqa: BLE001
                 LOGGER.exception(
-                    "Transcription failed for %s with model %s", audio_path, model_name
+                    "Transcription failed for row %d with model %s", idx, model_name
                 )
                 frame.at[idx, model_name] = ERROR_TOKEN
     return frame
@@ -160,6 +187,7 @@ def transcribe_sequential(
     df: pd.DataFrame,
     model_names: Sequence[str],
     silence_flags: Dict[int, bool],
+    arrays: Dict[int, Tuple[np.ndarray, int]],
     *,
     same_gpu: bool,
     show_progress: bool,
@@ -184,12 +212,15 @@ def transcribe_sequential(
         for idx in iterator:
             if silence_flags.get(idx, False):
                 continue
-            audio_path = frame.at[idx, "wav"]
+            audio_input = arrays.get(idx)
+            if audio_input is None:
+                frame.at[idx, model_name] = ERROR_TOKEN
+                continue
             try:
-                frame.at[idx, model_name] = parser.transcribe(audio_path)
+                frame.at[idx, model_name] = parser.transcribe(audio_input)
             except Exception:  # noqa: BLE001
                 LOGGER.exception(
-                    "Transcription failed for %s with model %s", audio_path, model_name
+                    "Transcription failed for row %d with model %s", idx, model_name
                 )
                 frame.at[idx, model_name] = ERROR_TOKEN
 
@@ -216,14 +247,15 @@ def main() -> None:
     if not model_names:
         raise ValueError("Configuration must include an 'asr_models' list.")
 
-    threshold = float(config.get("threshold", 0.0))
-
     df = pd.read_csv(args.csv)
     ensure_columns(df, ["wav"])
 
+    LOGGER.info("Loading audio files into memory")
+    arrays = load_audio_arrays(df, show_progress=not args.no_progress)
+
     LOGGER.info("Detecting silent utterances")
     silence_flags = compute_silence_flags(
-        df, args.silence_threshold, show_progress=not args.no_progress
+        arrays, args.silence_threshold, show_progress=not args.no_progress
     )
 
     LOGGER.info(
@@ -237,6 +269,7 @@ def main() -> None:
             df,
             model_names,
             silence_flags,
+            arrays,
             same_gpu=args.same_gpu,
             show_progress=not args.no_progress,
         )
@@ -245,6 +278,7 @@ def main() -> None:
             df,
             model_names,
             silence_flags,
+            arrays,
             same_gpu=args.same_gpu,
             show_progress=not args.no_progress,
         )
@@ -253,8 +287,10 @@ def main() -> None:
         LOGGER.info("Computing agreement metrics")
         transcribed = enrich_dataframe(
             transcribed,
-            model_names,
-            threshold,
+            emilia_text_column="text",
+            whisper_column="whisper",
+            phi4_column="phi4",
+            normalize_fn=ASRParser.normalize_text,
             show_progress=not args.no_progress,
         )
 

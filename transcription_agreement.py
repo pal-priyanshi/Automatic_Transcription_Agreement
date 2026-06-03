@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from difflib import SequenceMatcher
 from itertools import combinations
-from typing import Dict, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import pandas as pd
 from tqdm import tqdm
@@ -34,105 +33,123 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
     return previous_row[-1] / len(ref_tokens)
 
 
-def merge_transcriptions(texts: Sequence[str]) -> str:
-    """Merge multiple transcripts by stitching their longest common subsequences."""
-
-    cleaned = [text for text in texts if isinstance(text, str) and text.strip()]
-    if not cleaned:
-        return ""
-
-    merged = cleaned[0]
-    for text in cleaned[1:]:
-        match = SequenceMatcher(None, merged, text).find_longest_match(
-            0, len(merged), 0, len(text)
-        )
-        if match.size > 0:
-            prefix = merged[: match.a]
-            common = merged[match.a : match.a + match.size]
-            suffix = text[match.b + match.size :]
-            merged = f"{prefix}{common}{suffix}"
-        else:
-            merged = f"{merged} {text}"
-    return merged
+def symmetric_wer(a: str, b: str) -> float:
+    """Return the minimum of wer(a, b) and wer(b, a)."""
+    return min(word_error_rate(a, b), word_error_rate(b, a))
 
 
-def pairwise_word_error_rates(texts: Sequence[str]) -> Dict[Tuple[str, str], float]:
-    """Compute symmetric WER across every pair of transcripts."""
-
-    scores: Dict[Tuple[str, str], float] = {}
-    for left, right in combinations(texts, 2):
-        wer = min(word_error_rate(left, right), word_error_rate(right, left))
-        scores[(left, right)] = wer
-    return scores
+def is_special_token(text: str) -> bool:
+    return text.startswith(SPECIAL_TOKEN_PATTERN[0]) and text.endswith(
+        SPECIAL_TOKEN_PATTERN[1]
+    )
 
 
-def average_word_error_rates(texts: Sequence[str]) -> Dict[str, float]:
-    """Aggregate average WER scores for each transcript."""
+def majority_vote(
+    emilia: str,
+    whisper: str,
+    phi4: str,
+) -> Tuple[Optional[str], Optional[float], Optional[float], Optional[float]]:
+    """Given three normalized transcriptions, return the majority transcript.
 
-    totals: Dict[str, Dict[str, float]] = {
-        text: {"total": 0.0, "count": 0.0} for text in texts
-    }
-    for (left, right), score in pairwise_word_error_rates(texts).items():
-        totals[left]["total"] += score
-        totals[left]["count"] += 1
-        totals[right]["total"] += score
-        totals[right]["count"] += 1
+    Majority is defined as the transcript shared (lowest WER) by at least
+    two of the three.  All three pairwise WER scores are always returned so
+    callers can inspect the full distribution.
 
-    averages: Dict[str, float] = {}
-    for text, data in totals.items():
-        if data["count"]:
-            averages[text] = data["total"] / data["count"]
-        else:
-            averages[text] = data["total"]
-    return averages
-
-
-def select_best_transcription(texts: Sequence[str]) -> Tuple[str, float]:
-    """Return the transcript with the lowest average WER and its score.
-    Therefore if there is a transcript that is identical to all others, it will be
-    selected with a score of 0.0. (full match)
+    Returns
+    -------
+    majority_transcript : str or None
+        The transcript that represents the majority, or None if all three differ.
+    wer_emilia_whisper : float
+    wer_emilia_phi4 : float
+    wer_whisper_phi4 : float
     """
+    wer_ew = symmetric_wer(emilia, whisper)
+    wer_ep = symmetric_wer(emilia, phi4)
+    wer_wp = symmetric_wer(whisper, phi4)
 
-    if not texts:
-        return "", float("inf")
-    averages = average_word_error_rates(texts)
-    best_text = min(averages, key=averages.get)
-    return best_text, averages[best_text]
+    # The pair with the lowest WER is the "most agreed" pair.
+    best_pair = min(
+        [("emilia_whisper", wer_ew), ("emilia_phi4", wer_ep), ("whisper_phi4", wer_wp)],
+        key=lambda x: x[1],
+    )
+
+    pair_name = best_pair[0]
+    if pair_name == "emilia_whisper":
+        majority = emilia  # both say the same thing; use emilia text as canonical
+    elif pair_name == "emilia_phi4":
+        majority = emilia
+    else:
+        majority = whisper  # whisper and phi4 agree; use whisper as canonical
+
+    return majority, wer_ew, wer_ep, wer_wp
 
 
 def enrich_dataframe(
     df: pd.DataFrame,
-    model_columns: Sequence[str],
-    threshold: float,
+    emilia_text_column: str,
+    whisper_column: str,
+    phi4_column: str,
+    normalize_fn,
     *,
     show_progress: bool = False,
 ) -> pd.DataFrame:
-    """Add agreement-related columns to the provided dataframe."""
+    """Add agreement-related columns to *df*.
 
+    New columns added
+    -----------------
+    emilia_normalized     : normalized Emilia text
+    majority_transcript   : transcript agreed on by at least 2/3
+    emilia_agrees         : True if Emilia is part of the majority pair, else False
+    wer_emilia_whisper    : WER between normalized Emilia and Whisper output
+    wer_emilia_phi4       : WER between normalized Emilia and Phi-4 output
+    wer_whisper_phi4      : WER between Whisper and Phi-4 outputs
+    """
     frame = df.copy()
-    if "agreement_wrd" not in frame.columns:
-        frame["agreement_wrd"] = ""
-    if "best_ai_wrd" not in frame.columns:
-        frame["best_ai_wrd"] = "<None>"
+
+    new_cols = [
+        "emilia_normalized",
+        "majority_transcript",
+        "emilia_agrees",
+        "wer_emilia_whisper",
+        "wer_emilia_phi4",
+        "wer_whisper_phi4",
+    ]
+    for col in new_cols:
+        if col not in frame.columns:
+            frame[col] = None
 
     iterator = frame.iterrows()
     if show_progress:
-        iterator = tqdm(iterator, total=frame.shape[0])
+        iterator = tqdm(iterator, total=frame.shape[0], desc="Agreement")
 
     for idx, row in iterator:
-        transcripts = [row[col] for col in model_columns if isinstance(row[col], str)]
-        transcripts = [text.strip() for text in transcripts if text and text.strip()]
-        transcripts = [
-            text
-            for text in transcripts
-            if not (text.startswith(SPECIAL_TOKEN_PATTERN[0]) and text.endswith(SPECIAL_TOKEN_PATTERN[1]))
-        ]
-        if not transcripts:
+        emilia_raw = row.get(emilia_text_column, "")
+        whisper_out = row.get(whisper_column, "")
+        phi4_out = row.get(phi4_column, "")
+
+        # Skip rows with missing or special-token outputs.
+        if not isinstance(emilia_raw, str) or not emilia_raw.strip():
+            continue
+        if not isinstance(whisper_out, str) or is_special_token(whisper_out):
+            continue
+        if not isinstance(phi4_out, str) or is_special_token(phi4_out):
             continue
 
-        frame.at[idx, "agreement_wrd"] = merge_transcriptions(transcripts)
-        best_text, best_score = select_best_transcription(transcripts)
-        frame.at[idx, "best_ai_wrd"] = (
-            best_text if best_score <= threshold else "<WER above threshold>"
+        emilia_norm = normalize_fn(emilia_raw)
+        frame.at[idx, "emilia_normalized"] = emilia_norm
+
+        majority, wer_ew, wer_ep, wer_wp = majority_vote(
+            emilia_norm, whisper_out, phi4_out
         )
+
+        frame.at[idx, "majority_transcript"] = majority
+        frame.at[idx, "wer_emilia_whisper"] = round(wer_ew, 4)
+        frame.at[idx, "wer_emilia_phi4"] = round(wer_ep, 4)
+        frame.at[idx, "wer_whisper_phi4"] = round(wer_wp, 4)
+
+        # emilia_agrees = True when emilia is part of the closest-matching pair.
+        best_pair_wer = min(wer_ew, wer_ep, wer_wp)
+        emilia_in_best = (wer_ew == best_pair_wer) or (wer_ep == best_pair_wer)
+        frame.at[idx, "emilia_agrees"] = emilia_in_best
+
     return frame

@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import io
 import logging
+import queue
 import tarfile
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -23,6 +25,8 @@ LOGGER = logging.getLogger(__name__)
 ERROR_TOKEN = "<Error>"
 
 DEFAULT_BATCH_SIZE = 16
+_SENTINEL = object()       # signals end-of-tar from prefetch worker
+_PREFETCH_BATCHES = 3      # how many batches to buffer ahead in the queue
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +48,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-agreement", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Append to an existing output CSV, skipping shards that are already present.",
+    )
     return parser.parse_args()
 
 
@@ -73,6 +81,70 @@ def build_basename_index(group: pd.DataFrame) -> Dict[str, int]:
     return {basename(row["inner_path"]): idx for idx, row in group.iterrows()}
 
 
+def _tar_prefetch_worker(
+    shard_path: str,
+    basename_to_idx: Dict[str, int],
+    out_queue: "queue.Queue[object]",
+) -> None:
+    """Read and decode audio from a tar in a background thread, push items to queue.
+
+    Each item is (dataframe_idx, audio_array, sample_rate).
+    Decode errors push (idx, None, None).  A _SENTINEL object signals end-of-tar.
+    """
+    try:
+        with tarfile.open(shard_path, "r:*") as tar:
+            for member in tar:
+                if not member.isfile() or not member.name.endswith(".mp3"):
+                    continue
+                idx = basename_to_idx.get(basename(member.name))
+                if idx is None:
+                    continue
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+                try:
+                    audio, sr = decode_mp3_bytes(extracted.read())
+                    out_queue.put((idx, audio, sr))
+                except Exception:
+                    LOGGER.exception("Failed to decode %s", member.name)
+                    out_queue.put((idx, None, None))
+    finally:
+        out_queue.put(_SENTINEL)
+
+
+def _drain_prefetch_queue(
+    q: "queue.Queue[object]",
+    batch_size: int,
+    parsers: List[Tuple[str, "ASRParser"]],
+    frame: pd.DataFrame,
+    progress: tqdm,
+) -> None:
+    """Consume the prefetch queue, assembling batches and calling flush_batch."""
+    batch_indices: List[int] = []
+    batch_audio: List[Tuple[np.ndarray, int]] = []
+
+    while True:
+        item = q.get()
+        if item is _SENTINEL:
+            break
+        idx, audio, sr = item
+        if audio is None:
+            for name, _ in parsers:
+                frame.at[idx, name] = ERROR_TOKEN
+            progress.update(1)
+            continue
+        batch_indices.append(idx)
+        batch_audio.append((audio, sr))
+        if len(batch_audio) >= batch_size:
+            flush_batch(batch_indices, batch_audio, parsers, frame)
+            progress.update(len(batch_indices))
+            batch_indices, batch_audio = [], []
+
+    if batch_audio:
+        flush_batch(batch_indices, batch_audio, parsers, frame)
+        progress.update(len(batch_indices))
+
+
 def flush_batch(
     batch_indices: List[int],
     batch_audio: List[Tuple[np.ndarray, int]],
@@ -100,7 +172,7 @@ def stream_shard_parallel(
     *,
     show_progress: bool,
 ) -> pd.DataFrame:
-    """Open tar once, buffer audio into batches, transcribe with all models per batch."""
+    """Open tar once; a background thread decodes audio while GPU runs inference."""
     frame = group.copy()
     for name in model_names:
         if name not in frame.columns:
@@ -109,42 +181,15 @@ def stream_shard_parallel(
     basename_to_idx = build_basename_index(frame)
     progress = tqdm(total=len(frame), desc=Path(shard_path).name, disable=not show_progress)
 
-    batch_indices: List[int] = []
-    batch_audio: List[Tuple[np.ndarray, int]] = []
-
-    with tarfile.open(shard_path, "r:*") as tar:
-        for member in tar:
-            if not member.isfile() or not member.name.endswith(".mp3"):
-                continue
-            idx = basename_to_idx.get(basename(member.name))
-            if idx is None:
-                continue
-
-            extracted = tar.extractfile(member)
-            if extracted is None:
-                continue
-
-            try:
-                audio, sr = decode_mp3_bytes(extracted.read())
-            except Exception:
-                LOGGER.exception("Failed to decode %s", member.name)
-                for name, _ in parsers:
-                    frame.at[idx, name] = ERROR_TOKEN
-                progress.update(1)
-                continue
-
-            batch_indices.append(idx)
-            batch_audio.append((audio, sr))
-
-            if len(batch_audio) >= batch_size:
-                flush_batch(batch_indices, batch_audio, parsers, frame)
-                progress.update(len(batch_indices))
-                batch_indices, batch_audio = [], []
-
-    # flush remaining
-    if batch_audio:
-        flush_batch(batch_indices, batch_audio, parsers, frame)
-        progress.update(len(batch_indices))
+    q: queue.Queue = queue.Queue(maxsize=batch_size * _PREFETCH_BATCHES)
+    worker = threading.Thread(
+        target=_tar_prefetch_worker,
+        args=(shard_path, basename_to_idx, q),
+        daemon=True,
+    )
+    worker.start()
+    _drain_prefetch_queue(q, batch_size, parsers, frame, progress)
+    worker.join()
 
     progress.close()
     return frame
@@ -160,7 +205,7 @@ def stream_shard_sequential(
     show_progress: bool,
     checkpoint_path: Optional[Path] = None,
 ) -> pd.DataFrame:
-    """Load one model at a time, stream tar once per model, process in batches."""
+    """Load one model at a time; a background thread decodes audio while GPU runs inference."""
     frame = group.copy()
     for name in model_names:
         if name not in frame.columns:
@@ -179,55 +224,15 @@ def stream_shard_sequential(
             disable=not show_progress,
         )
 
-        batch_indices: List[int] = []
-        batch_audio: List[Tuple[np.ndarray, int]] = []
-
-        with tarfile.open(shard_path, "r:*") as tar:
-            for member in tar:
-                if not member.isfile() or not member.name.endswith(".mp3"):
-                    continue
-                idx = basename_to_idx.get(basename(member.name))
-                if idx is None:
-                    continue
-
-                extracted = tar.extractfile(member)
-                if extracted is None:
-                    continue
-
-                try:
-                    audio, sr = decode_mp3_bytes(extracted.read())
-                except Exception:
-                    LOGGER.exception("Failed to decode %s", member.name)
-                    frame.at[idx, model_name] = ERROR_TOKEN
-                    progress.update(1)
-                    continue
-
-                batch_indices.append(idx)
-                batch_audio.append((audio, sr))
-
-                if len(batch_audio) >= batch_size:
-                    try:
-                        results = parser.transcribe_batch(batch_audio)
-                        for i, text in zip(batch_indices, results):
-                            frame.at[i, model_name] = text
-                    except Exception:
-                        LOGGER.exception("Batch failed for %s", model_name)
-                        for i in batch_indices:
-                            frame.at[i, model_name] = ERROR_TOKEN
-                    progress.update(len(batch_indices))
-                    batch_indices, batch_audio = [], []
-
-        # flush remaining
-        if batch_audio:
-            try:
-                results = parser.transcribe_batch(batch_audio)
-                for i, text in zip(batch_indices, results):
-                    frame.at[i, model_name] = text
-            except Exception:
-                LOGGER.exception("Batch failed for %s", model_name)
-                for i in batch_indices:
-                    frame.at[i, model_name] = ERROR_TOKEN
-            progress.update(len(batch_indices))
+        q: queue.Queue = queue.Queue(maxsize=batch_size * _PREFETCH_BATCHES)
+        worker = threading.Thread(
+            target=_tar_prefetch_worker,
+            args=(shard_path, basename_to_idx, q),
+            daemon=True,
+        )
+        worker.start()
+        _drain_prefetch_queue(q, batch_size, [(model_name, parser)], frame, progress)
+        worker.join()
 
         progress.close()
         del parser
@@ -236,15 +241,8 @@ def stream_shard_sequential(
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
-        # Save partial results after each model completes so progress is not lost
-        # if a subsequent model crashes.
         if checkpoint_path is not None:
-            frame.to_csv(
-                checkpoint_path,
-                mode="w" if model_idx == 0 else "w",
-                header=True,
-                index=False,
-            )
+            frame.to_csv(checkpoint_path, mode="w", header=True, index=False)
             LOGGER.info("Checkpoint saved after %s → %s", model_name, checkpoint_path)
 
     return frame
@@ -254,6 +252,17 @@ def compute_output_path(csv_path: Path, output: Optional[Path]) -> Path:
     if output is not None:
         return output
     return csv_path.with_name(f"transcribed_{csv_path.name}")
+
+
+def load_completed_shards(output_path: Path) -> set:
+    """Return the set of shard paths already written to output_path."""
+    if not output_path.exists():
+        return set()
+    try:
+        return set(pd.read_csv(output_path, usecols=["shard"])["shard"].unique())
+    except Exception:
+        LOGGER.warning("Could not read %s for resume; starting fresh.", output_path)
+        return set()
 
 
 def main() -> None:
@@ -280,7 +289,16 @@ def main() -> None:
     )
 
     output_path = compute_output_path(args.csv, args.output)
-    write_header = True  # first shard writes header, rest append
+
+    done_shards = load_completed_shards(output_path) if args.resume else set()
+    if done_shards:
+        before = len(shards)
+        shards = [(s, g) for s, g in shards if s not in done_shards]
+        LOGGER.info("Resume: skipping %d/%d already-completed shard(s).", len(done_shards), before)
+
+    # If resuming into an existing file, append without re-writing the header.
+    appending = args.resume and output_path.exists() and bool(done_shards)
+    write_header = not appending
 
     if args.sequential:
         for shard_path, group in shards:
@@ -299,8 +317,9 @@ def main() -> None:
                     normalize_fn=ASRParser.normalize_text,
                     show_progress=not args.no_progress,
                 )
-            transcribed.to_csv(output_path, mode="w" if write_header else "a",
+            transcribed.to_csv(output_path, mode="a" if appending else "w",
                                header=write_header, index=False)
+            appending = True
             write_header = False
             LOGGER.info("Saved progress to %s", output_path)
     else:
@@ -325,8 +344,9 @@ def main() -> None:
                     normalize_fn=ASRParser.normalize_text,
                     show_progress=not args.no_progress,
                 )
-            transcribed.to_csv(output_path, mode="w" if write_header else "a",
+            transcribed.to_csv(output_path, mode="a" if appending else "w",
                                header=write_header, index=False)
+            appending = True
             write_header = False
             LOGGER.info("Saved progress to %s", output_path)
 

@@ -209,7 +209,9 @@ class ASRParser:
         ).to(self.device)
 
         kwargs = {
-            "max_new_tokens": 1000,
+            # Emilia clips are typically 2–30 s → well under 256 output tokens.
+            # Keeping this low saves significant KV-cache memory during generation.
+            "max_new_tokens": 256,
             "generation_config": self.generation_config,
             "num_logits_to_keep": 1,
         }

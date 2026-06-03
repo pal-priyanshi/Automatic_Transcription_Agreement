@@ -145,6 +145,42 @@ def _drain_prefetch_queue(
         progress.update(len(batch_indices))
 
 
+def _transcribe_with_oom_retry(
+    parser: ASRParser,
+    batch_audio: List[Tuple[np.ndarray, int]],
+    model_name: str,
+) -> List[str]:
+    """Transcribe batch; on CUDA OOM halve the batch and retry recursively.
+
+    Keeps halving until the sub-batch fits or a single sample still OOMs
+    (in which case that sample is returned as ERROR_TOKEN).
+    """
+    if not batch_audio:
+        return []
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return parser.transcribe_batch(batch_audio)
+    except torch.cuda.OutOfMemoryError:
+        if len(batch_audio) == 1:
+            LOGGER.error(
+                "OOM on single sample for %s — skipping (marked as error).", model_name
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return [ERROR_TOKEN]
+        half = len(batch_audio) // 2
+        LOGGER.warning(
+            "OOM for %s at batch_size=%d — retrying as two halves of %d.",
+            model_name, len(batch_audio), half,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        first = _transcribe_with_oom_retry(parser, batch_audio[:half], model_name)
+        second = _transcribe_with_oom_retry(parser, batch_audio[half:], model_name)
+        return first + second
+
+
 def flush_batch(
     batch_indices: List[int],
     batch_audio: List[Tuple[np.ndarray, int]],
@@ -154,7 +190,7 @@ def flush_batch(
     """Transcribe a collected batch with all models and write results into frame."""
     for name, parser in parsers:
         try:
-            results = parser.transcribe_batch(batch_audio)
+            results = _transcribe_with_oom_retry(parser, batch_audio, name)
             for idx, text in zip(batch_indices, results):
                 frame.at[idx, name] = text
         except Exception:

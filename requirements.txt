@@ -9,3 +9,4 @@ transformers==4.51.3
 tqdm
 peft
 backoff
+webdataset

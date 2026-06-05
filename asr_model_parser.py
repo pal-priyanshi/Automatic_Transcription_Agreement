@@ -161,11 +161,24 @@ class ASRParser:
         self.processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=True
         )
+        # Use Flash Attention 2 if available (pip install flash-attn --no-build-isolation).
+        # Falls back to "eager" (slow) if not installed — install it on the cluster for
+        # a significant speedup on Phi-4's long audio conformer sequences.
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+        except ImportError:
+            LOGGER.warning(
+                "flash-attn not installed — using eager attention (slow). "
+                "Run: pip install flash-attn --no-build-isolation"
+            )
+            attn_impl = "eager"
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
-            _attn_implementation="eager",
+            _attn_implementation=attn_impl,
         ).to(self.device)
 
         self.generation_config = GenerationConfig.from_pretrained(model_path)

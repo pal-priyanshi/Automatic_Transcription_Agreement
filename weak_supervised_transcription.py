@@ -17,6 +17,7 @@ no separate manifest CSV is required.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import glob as glob_module
 import io
 import json
@@ -239,16 +240,28 @@ def _flush_batch_parallel(
     batch_audio: List[Tuple[np.ndarray, int]],
     parsers: List[Tuple[str, ASRParser]],
 ) -> None:
-    """Run all models on a batch; write transcriptions into the row dicts in-place."""
-    for name, parser in parsers:
-        try:
-            results = _transcribe_with_oom_retry(parser, batch_audio, name)
-            for row, text in zip(batch_rows, results):
-                row[name] = text
-        except Exception:
-            LOGGER.exception("Batch transcription failed for model %s", name)
-            for row in batch_rows:
-                row[name] = ERROR_TOKEN
+    """Run all models on a batch concurrently across GPUs.
+
+    Each model runs in its own thread.  GPU operations release the GIL, so
+    models on different CUDA devices genuinely overlap — GPU 0 and GPU 1
+    both run at the same time instead of waiting for each other.
+    """
+    def _run(name: str, parser: ASRParser):
+        return name, _transcribe_with_oom_retry(parser, batch_audio, name)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(parsers)) as pool:
+        futures = [pool.submit(_run, name, parser) for name, parser in parsers]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                name, results = future.result()
+                for row, text in zip(batch_rows, results):
+                    row[name] = text
+            except Exception:
+                LOGGER.exception("Batch transcription failed for a model.")
+                for row in batch_rows:
+                    for name, _ in parsers:
+                        if name not in row or not row[name]:
+                            row[name] = ERROR_TOKEN
 
 
 def _flush_batch_sequential(
@@ -289,7 +302,7 @@ def process_shard_parallel(
 ) -> pd.DataFrame:
     """Stream shard once; run all models on each batch before moving to the next."""
     loader = _make_dataloader(shard_path)
-    progress = tqdm(desc=Path(shard_path).name, disable=not show_progress)
+    progress = tqdm(desc=Path(shard_path).name, unit="sample", disable=not show_progress)
 
     all_rows:   List[dict]                    = []
     batch_rows: List[dict]                    = []
@@ -340,6 +353,7 @@ def process_shard_sequential(
 
         progress = tqdm(
             desc=f"{Path(shard_path).name} [{model_name}]",
+            unit="sample",
             disable=not show_progress,
         )
 
